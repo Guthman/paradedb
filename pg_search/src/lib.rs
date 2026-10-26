@@ -144,6 +144,9 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         );
     }
 
+    // Before any hook is installed: see `postgres::foreign_thread`.
+    postgres::foreign_thread::mark_main_thread();
+
     // Register the DST assertion catalog for this process (a no-op outside `--features dst`)
     dst::init();
 

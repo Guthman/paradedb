@@ -28,6 +28,7 @@ use crate::postgres::customscan::builders::custom_path::{
 use crate::postgres::customscan::orderby::validate_topk_compatibility;
 use crate::postgres::customscan::qual_inspect::{PlannerContext, QualExtractState, extract_quals};
 use crate::postgres::customscan::{CreateUpperPathsHookArgs, CustomScan, RelPathlistHookArgs};
+use crate::postgres::foreign_thread;
 use crate::postgres::node::NodeExt;
 use crate::postgres::planner_warnings::{clear_planner_warnings, emit_planner_warnings};
 use crate::postgres::rel_get_bm25_index;
@@ -130,6 +131,10 @@ pub extern "C-unwind" fn paradedb_rel_pathlist_callback<CS>(
     CS: CustomScan<Args = RelPathlistHookArgs> + 'static,
 {
     unsafe {
+        if !foreign_thread::is_main_thread() {
+            return;
+        }
+
         // Skip dummy relations (proven empty, e.g. via constraint exclusion).
         // Adding a custom path replaces/precedes the dummy Append path in rel->pathlist,
         // breaking is_dummy_rel and crashing Postgres indxpath assertions (Assert(outer_rel->rows > 0)).
@@ -213,6 +218,10 @@ pub extern "C-unwind" fn paradedb_upper_paths_callback<CS>(
 ) where
     CS: CustomScan<Args = CreateUpperPathsHookArgs> + 'static,
 {
+    if !foreign_thread::is_main_thread() {
+        return;
+    }
+
     if !pg_search_extension_installed() {
         return;
     }
@@ -267,7 +276,25 @@ static mut PREV_PLANNER_HOOK: pg_sys::planner_hook_type = None;
 ///    calls that get projected through the plan tree.
 pub unsafe fn register_planner_hook() {
     PREV_PLANNER_HOOK = pg_sys::planner_hook;
-    pg_sys::planner_hook = Some(paradedb_planner_hook);
+    pg_sys::planner_hook = Some(planner_hook_entry);
+}
+
+/// Not `#[pg_guard]`: see `postgres::foreign_thread`.
+unsafe extern "C-unwind" fn planner_hook_entry(
+    parse: *mut pg_sys::Query,
+    query_string: *const ::core::ffi::c_char,
+    cursor_options: ::core::ffi::c_int,
+    bound_params: pg_sys::ParamListInfo,
+) -> *mut pg_sys::PlannedStmt {
+    unsafe {
+        if foreign_thread::is_main_thread() {
+            paradedb_planner_hook(parse, query_string, cursor_options, bound_params)
+        } else if let Some(prev_hook) = PREV_PLANNER_HOOK {
+            prev_hook(parse, query_string, cursor_options, bound_params)
+        } else {
+            foreign_thread::standard_planner(parse, query_string, cursor_options, bound_params)
+        }
+    }
 }
 
 /// Check if the WHERE clause can be handled by our custom scan.
@@ -901,6 +928,10 @@ pub fn register_subplan_join_pathlist() {
                 #[allow(static_mut_refs)]
                 if let Some(prev) = PREV_HOOK {
                     prev(root, rel, rti, rte);
+                }
+
+                if !foreign_thread::is_main_thread() {
+                    return;
                 }
 
                 // Skip relations proven empty; see comment in paradedb_rel_pathlist_callback.

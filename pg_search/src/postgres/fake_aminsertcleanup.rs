@@ -85,6 +85,7 @@
 #![allow(static_mut_refs)]
 
 use crate::api::HashMap;
+use crate::postgres::foreign_thread;
 use crate::postgres::insert::{InsertMode, InsertState, insertcleanup};
 use pgrx::pg_sys::{QueryDesc, ScanDirection, uint64};
 use pgrx::{pg_guard, pg_sys};
@@ -307,12 +308,12 @@ pub unsafe fn register() {
     static mut PREV_EXECUTOR_FINISH_HOOK: pg_sys::ExecutorFinish_hook_type = None;
 
     PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
-    pg_sys::ProcessUtility_hook = Some(process_utility_hook);
+    pg_sys::ProcessUtility_hook = Some(process_utility_hook_entry);
 
     PREV_EXECUTOR_RUN_HOOK = pg_sys::ExecutorRun_hook;
     #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
     {
-        pg_sys::ExecutorRun_hook = Some(executor_run_hook_pg15_17);
+        pg_sys::ExecutorRun_hook = Some(executor_run_hook_pg15_17_entry);
     }
     #[cfg(feature = "pg18")]
     {
@@ -320,7 +321,65 @@ pub unsafe fn register() {
     }
 
     PREV_EXECUTOR_FINISH_HOOK = pg_sys::ExecutorFinish_hook;
-    pg_sys::ExecutorFinish_hook = Some(executor_finish_hook);
+    pg_sys::ExecutorFinish_hook = Some(executor_finish_hook_entry);
+
+    // -----------------------------------------------------------------------
+    // Registered entry points. Not `#[pg_guard]`: see `postgres::foreign_thread`.
+    // On a foreign thread they skip the InsertFrame, which only tracks inserts
+    // into our indexes made on the main thread.
+    // -----------------------------------------------------------------------
+    #[allow(clippy::too_many_arguments)]
+    #[rustfmt::skip]
+    unsafe extern "C-unwind" fn process_utility_hook_entry(
+        pstmt: *mut pg_sys::PlannedStmt,
+        query_string: *const ::core::ffi::c_char,
+        read_only_tree: bool,
+        context: pg_sys::ProcessUtilityContext::Type,
+        params: pg_sys::ParamListInfo,
+        query_env: *mut pg_sys::QueryEnvironment,
+        dest: *mut pg_sys::DestReceiver,
+        qc: *mut pg_sys::QueryCompletion,
+    ) {
+        unsafe {
+            if foreign_thread::is_main_thread() {
+                process_utility_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+            } else if let Some(prev_hook) = PREV_PROCESS_UTILITY_HOOK {
+                prev_hook(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+            } else {
+                foreign_thread::standard_ProcessUtility(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+            }
+        }
+    }
+
+    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+    unsafe extern "C-unwind" fn executor_run_hook_pg15_17_entry(
+        query_desc: *mut QueryDesc,
+        direction: ScanDirection::Type,
+        count: uint64,
+        execute_once: bool,
+    ) {
+        unsafe {
+            if foreign_thread::is_main_thread() {
+                executor_run_hook_pg15_17(query_desc, direction, count, execute_once);
+            } else if let Some(prev_hook) = PREV_EXECUTOR_RUN_HOOK {
+                prev_hook(query_desc, direction, count, execute_once);
+            } else {
+                foreign_thread::standard_ExecutorRun(query_desc, direction, count, execute_once);
+            }
+        }
+    }
+
+    unsafe extern "C-unwind" fn executor_finish_hook_entry(query_desc: *mut pg_sys::QueryDesc) {
+        unsafe {
+            if foreign_thread::is_main_thread() {
+                executor_finish_hook(query_desc);
+            } else if let Some(prev_hook) = PREV_EXECUTOR_FINISH_HOOK {
+                prev_hook(query_desc);
+            } else {
+                foreign_thread::standard_ExecutorFinish(query_desc);
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // ProcessUtility hook

@@ -18,6 +18,7 @@
 use crate::index::fast_fields_helper::{FFHelper, WhichFastField};
 use crate::index::reader::index::SearchIndexReader;
 use crate::postgres::catalog::OidExt;
+use crate::postgres::foreign_thread;
 use crate::postgres::index::is_partitioned_index;
 use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::utils::{FieldSource, pg_search_extension_installed};
@@ -38,6 +39,9 @@ pub(crate) fn register_hook() {
         unsafe {
             if let Some(previous_hook) = PREV_HOOK {
                 previous_hook(root, rel, rti, rte);
+            }
+            if !foreign_thread::is_main_thread() {
+                return;
             }
             if !pg_sys::enable_indexonlyscan || !pg_search_extension_installed() {
                 return;

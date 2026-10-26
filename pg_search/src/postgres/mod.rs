@@ -60,6 +60,7 @@ pub mod customscan;
 pub mod datetime;
 #[cfg(not(any(feature = "pg17", feature = "pg18")))]
 pub mod fake_aminsertcleanup;
+pub mod foreign_thread;
 pub mod heap;
 pub mod index;
 pub(crate) mod index_only;
